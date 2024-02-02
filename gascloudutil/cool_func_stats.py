@@ -266,7 +266,7 @@ def find_special_locations(parametric_curve, *, s_bounds, brute_step,
 
     def inv_tcool(s):
         vals = parametric_curve(s)
-        return 1.0/cooling_curve.calculate_tcool(*vals)
+        return 1.0/cooling_curve.calculate_tcool_CGS(*vals)
 
     return _find_important_locations(
         inv_tcool = inv_tcool, s_bounds = s_bounds, brute_step = brute_step,

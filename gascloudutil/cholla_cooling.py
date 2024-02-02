@@ -1,9 +1,16 @@
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
+import unyt
+import unyt.dimensions as udims
 
 class _ChollaConstants:
     kboltz_cgs: float = 1.380658e-16
     mh_cgs: float = 1.672622e-24
+
+    def kboltz_quan(self):
+        return unyt.unyt_quantity(self.kboltz_cgs, "cm**2*g/(K*s**2)")
+    def mh_quan(self):
+        return unyt.unyt_quantity(self.mh_cgs, "g")
 
 def _cholla_CIE_cooling_func(n, T):
     # n is number denstiy (in units of cm**-3) and T is temperature (in Kelvin)
@@ -72,7 +79,6 @@ class _ChollaCloudyCoolingFunc:
             return cool[0]
         return cool
 
-
 class ChollaEOS:
 
     def __init__(self, cloudy_data_path = None, mmw = 0.6, gamma = 5.0/3.0,
@@ -94,47 +100,83 @@ class ChollaEOS:
         # rho is mass density and eint is specific internal energy (aka
         # specific thermal energy).
         # -> They both have cgs units (g/cm**3 & (cm/s)**2, respectively)
-        n = rho / (self._mmw * self._constants.mh_cgs)
-        T = (eint * (self._mmw * self._constants.mh_cgs * (self._gamma - 1.0))
-             / (self._constants.kboltz_cgs))
+        n = rho / (self._mmw * self._constants.mh_quan())
+        gm1 = self._gamma - 1.0
+        T = ( eint * (self._mmw * self._constants.mh_quan() * gm1) /
+              (self._constants.kboltz_quan()) )
         return n,T
 
+    @udims.returns(udims.temperature)
+    @udims.accepts(rho = udims.density, eint = udims.specific_energy)
     def calculate_T(self, rho, eint):
         # rho is mass density and eint is specific internal energy (aka
         # specific thermal energy).
         # -> They both have cgs units (g/cm**3 & (cm/s)**2, respectively)
         return self._calculate_nT(rho, eint)[1]
 
-    def rho_eint_from_nT(self, number_density, T):
+    def rho_eint_from_nT_CGS(self, number_density, T):
         rho = number_density * (self._mmw * self._constants.mh_cgs)
         eint = ( (self._constants.kboltz_cgs * T) /
                  (self._mmw * self._constants.mh_cgs * (self._gamma - 1.0)) )
         return rho, eint
 
+    @udims.accepts(number_density = udims.number_density, T = udims.temperature)
+    def rho_eint_from_nT(self, number_density, T):
+        """
+        Computes the mass density and specific internal energy
+
+        Parameters
+        ----------
+        number_density : unyt.unyt_array
+            number density of gas
+        T : unyt.unyt_array
+            gas temperature
+
+        Returns
+        -------
+        rho, eint : unyt.unyt_array
+            The equivalent mass density and specific thermal energy values
+        """
+        rho_cgs, eint_cgs = self.rho_eint_from_nT_CGS(
+            number_density = number_density.in_cgs().ndview,
+            T = T.to('K').in_cgs().ndview)
+        rho = unyt.unyt_array(rho_cgs, 'g/cm**3')
+        eint = unyt.unyt_array(eint_cgs, 'cm**2/s**2')
+        return rho, eint
+
     def _calculate_tcool(self, n, T, eint_dens):
         fn = self._cooling_func
         cool = -1.0 * fn(n = n, T=T)
-        #print(eint_dens)
+        
         return eint_dens / cool
 
-    def calculate_tcool(self, rho, eint):
-        # rho is mass density and eint is specific internal energy (aka
-        # specific thermal energy).
-        # -> They both have cgs units (g/cm**3 & (cm/s)**2, respectively)
-        #
-        # The result has units of seconds. A negative value corresponds to
-        # cooling. A positive value corresponds to heating
+    def calculate_tcool_CGS(self, rho, eint):
+        # just like calculate_tcool, but CGS units are implied!
         n, T = self._calculate_nT(rho, eint)
         return self._calculate_tcool(n, T, eint_dens = rho * eint)
 
-    def calculate_tcool_from_nT(self, number_density, T):
-        # The arguments should have cgs units!
-        #
-        # The result has units of seconds. A negative value corresponds to
-        # cooling. A positive value corresponds to heating
-        eint_dens = (number_density * T *self._constants.kboltz_cgs /
-                     (self._gamma - 1.0))
-        return self._calculate_tcool(number_density, T, eint_dens)
+    @udims.returns(udims.time)
+    @udims.accepts(rho = udims.density, eint = udims.specific_energy)
+    def calculate_tcool(self, rho, eint):
+        """
+        Computes a cooling timescale
+
+        Parameters
+        ----------
+        rho : unyt.unyt_array
+            Mass density
+        eint : unyt.unyt_array
+            specific internal energy (aka specific thermal energy)
+
+        Returns
+        -------
+        tcool : unyt.unyt_array
+            The cooling timescale. A positive value corresponds to heating. A
+            negative value corresponds to cooling.
+        """
+        tcool_seconds = self.calculate_tcool_CGS(rho = rho.in_cgs().ndview,
+                                                 eint = eint.in_cgs().ndview)
+        return unyt.unyt_array(tcool_seconds,'s')
 
     def get_gamma(self):
         return self._gamma
