@@ -5,6 +5,259 @@ from scipy.optimize import (
     minimize_scalar, root_scalar
 )
 
+from enum import Enum
+class EnergyFlow(Enum):
+    COOL = -1
+    NEUTRAL = 0
+    HEAT = 1
+
+class HeatCoolIntervals:
+    def __init__(self, intervals, energy_flow):
+        self.intervals = np.array(intervals)
+        self.energy_flow = energy_flow
+        assert len(intervals) > 1
+        assert len(energy_flow) == (intervals.size - 1)
+
+    @property
+    def num_intervals(self): return self.intervals.size - 1
+
+    def identify_interval(self, x):
+        interval_index = np.array(np.digitize(x, self.intervals))
+        if 0 in interval_index:
+            raise ValueError('1+ specified val lies outside of the intervals')
+        elif interval_index.max() > self.num_intervals:
+            # it's ok to be equal to num_intervals right now, since we
+            # will subtract 1 in a moment
+            raise ValueError('1+ specified val lies outside of the intervals')
+        return interval_index - 1
+
+    def get_energy_flow(self, index):
+        index = np.asanyarray(index)
+        assert np.all(np.logical_and(index>=0, index<self.num_intervals))
+        if np.ndim(index) == 0:
+            return self.energy_flow[index]
+        elif np.ndim(index):
+            return [self.energy_flow[int(i)] for i in index]
+        else:
+            raise ValueError("invalid choice...")
+
+def _max_ind_in_constval_segment(arr, start_ind):
+    # Imagine the elements of arr are grouped into a series of segments. In a
+    # given segment, all contiguous elements have the same element.
+    # -> this function returns the maximum index in the segment containing
+    #    start_ind
+    segment_val = arr[start_ind]
+    for i in range(start_ind + 1, len(arr)):
+        if arr[i] != segment_val:
+            return i - 1
+    return len(arr) - 1
+
+
+def zerointerval_transition(f, bracket, rtol, maxiter):
+    """
+    Local search for the transition-location for a scalar function between
+    a region where it evaluates to all positive (or all negative) values
+    and a region where it always evaluates to 0
+    """
+
+    # we might be able to be more clever using first derivatives. The first
+    # derivative will have a discontinuity at the exact transition point, but
+    # we may be able to use it to help us find the point faster...
+
+    if len(bracket) != 2:
+        raise ValueError("bracket must contain 2 values")
+    elif (bracket[0] >= bracket[1]):
+        raise ValueError("bracket[0] must exceed bracket[1]")
+    elif not (0.0 < rtol < 1.0):
+        raise ValueError("rtol must lie between 0.0 and 1.0")
+    elif (maxiter <= 0) or (int(maxiter) != maxiter):
+        raise ValueError("maxiter must be a positive integer")
+
+    assert (l > 0) and (r > 0)
+    l,r = bracket
+    f_l, f_r = f(l), f(r)
+    if (f_l == 0.0 and f_r != 0.0):
+        # return largest value that corresponds to a value of 0 (to do this,
+        # always keep the zero-region on the left)
+
+        # ATTEMPT AT CLEVERNESS (try to avoid returning bracket[0])
+        small_l_offset = min(r, l * (1+rtol))
+        if f(small_l_offset) == 0.0: 
+            l = small_l_offset
+        else:
+            r = small_l_offset
+
+        for count in range(maxiter):
+            midpoint = 0.5 * (l + r)
+            if (l * (1+rtol)) > midpoint:
+                break
+            elif f(midpoint) == 0.0:
+                l = midpoint
+            else:
+                r = midpoint
+        return l
+    elif (f_l != 0.0 and f_r == 0.0):
+        # return smallest value that corresponds to a value of 0 (to do this,
+        # always keep the zero-region on the right)
+
+        # ATTEMPT AT CLEVERNESS (try to avoid returning bracket[1])
+        small_r_offset = max(l, r * (1-rtol))
+        if f(small_r_offset) == 0.0: 
+            r = small_r_offset
+        else:
+            l = small_r_offset
+
+        for count in range(maxiter):
+            midpoint = 0.5 * (l + r)
+            if (r * (1-rtol)) < midpoint:
+                break
+            elif f(midpoint) == 0.0:
+                r = midpoint
+            else:
+                l = midpoint
+        return r
+    else:
+        raise ValueError("Either f(bracket[0]) or f(bracket[1]) MUST evaluate "
+                         "to 0.0 (BUT NOT BOTH)")
+
+def get_heat_cool_intervals(invtcool_fn, s_grid, invtcool_grid = None,
+                            maxiter_each = 500, s_rel_tol = 1e-8):
+    """
+    This function identifies the intervals on which a cooling function has net
+    heating, net cooling, or produces no net energy change.
+
+    In more detail, we consider the cooling function when it is parameterized,
+    by a single scalar parameter s. This uses a brute-force technique: it
+    performs the search for these intervals based on a grid of s values
+
+    Parameters
+    ----------
+    invtcool_fn : callable
+        A function that returns the reciprical of the cooling times scale at a
+        given value of s
+    s_grid : np.ndarray
+        A 1D array of s values that is used to control the search for these
+        intervals. This must contain at least 3 elements and the elements must
+        monotonically increase.
+    invtcool_grid : np.ndarray, Optional
+        Optional parameter used to specify the precomputed values of invtcool_fn
+        at each s value in s_grid
+    maxiter_each: int
+        The maximum number of iterations used in each rootfinding call and each 
+        call to identify extrema locations
+    s_rel_tol : float
+        The relative tolerance used to dictate when each rootfinding/extrema 
+        finding call terminates.
+    """
+    assert 0 < s_rel_tol < 1
+    assert isinstance(maxiter_each, int) and (maxiter_each > 0)
+    assert (s_grid.ndim == 1) and (s_grid.size >= 3)
+    if invtcool_grid is None:
+        invtcool_grid = invtcool_fn(s_grid)
+    assert (s_grid.shape == invtcool_grid.shape)
+    sign_grid = np.sign(invtcool_grid)
+
+    def left_s_val(s): return s * (1.0 - s_rel_tol)
+    def right_s_val(s): return s * (1.0 + s_rel_tol)
+
+    commonkw = {'f' : invtcool_fn, 'rtol' : s_rel_tol, 'maxiter' : maxiter_each}
+
+    # we are going to fill up the following 2 lists with interval data.
+    edges = [s_grid[0]]  # <-- will have N+1 items for N intervals
+    interval_signs = []  # <-- will have N items for N intervals
+
+    if sign_grid[0] == 0.0:
+        # we would should investigate whether this is a part of an interval
+        # with EnergyFlow.NEUTRAL OR it corresponds to a natural transition to
+        # EnergyFlow.COOL/EnergyFlow.HEAT
+        raise RuntimeError("setup needs to be more careful when "
+                           "sign_grids[0] has a value of 0")
+
+    grid_length = s_grid.size
+    # Each time we enter the while loop, we are considering a new interval.
+    # - in the body of the while loop, we determine the extent of the interval
+    #   and record its properties
+    max_grid_ind_curinterval = -1
+    while (max_grid_ind_curinterval + 1) != grid_length:
+        # the current interval extends from s = edges[-1]
+
+        # First, find the min element from s_grid contained in cur interval
+        min_grid_ind_curinterval = max_grid_index_curinterval + 1
+        # invariant: s_grid[min_grid_ind_curinterval] >= edges[-1]
+
+        # Next, find the max element from s_grid contained in cur interval
+        max_grid_ind_curinterval = _max_ind_in_constval_segment(
+            sign_grid, start_ind = min_grid_ind_curinterval)
+
+        # Now, identify the sign of the current interval:
+        cur_interval_sign = sign_grid[min_grid_ind_curinterval]
+
+        # Finally, we do the work of finding the precise end point and we
+        # record things
+        transition_bracket = (
+            sign_grid[max_grid_ind_curinterval:(max_grid_ind_curinterval+2)])
+        if cur_interval_sign != 0.0:
+            interval_signs.append(cur_interval_sign)
+            if (max_grid_ind_curinterval + 1) == grid_length:
+                edges.append(s_grid[max_grid_ind_curinterval])
+            elif sign_grid[max_grid_ind_curinterval + 1] != 0.0:
+                root_rslt = root_scalar(bracket = transition_bracket,
+                                        method='bisect', **commonkw)
+                if not root_rslt.converged:
+                    raise RuntimeError(
+                        f"Not converged. Termination flag: {root_rslt.flag!r}")
+                edges.append(root_rslt.root)
+            else: # sign_grid[max_grid_ind_curinterval + 1] == 0.0
+                # POTENTIAL CHALLENGE: s_grid[max_grid_ind_curinterval + 1] may
+                # exactly coincide with an isolated root of invtcool_fn OR it
+                # may coincide with an extended interval of zeros.
+                # -> right now, we only care how this affects the right edge of
+                #    current interval
+                edges.append(zerointerval_transition(
+                    bracket = transition_bracket, **commonkw))
+        else: # cur_interval_sign == 0.0
+            # Check whether the current "interval" is just an isolated point
+            # or is part of an extended region...
+            min_s_grid_val = s_grid[min_grid_ind_curinterval]
+            sLeft = max(left_s_val(min_s_grid_val), edges[-1])
+            max_s_grid_val = s_grid[max_grid_ind_curinterval]
+            sRight = min(right_s_val(max_s_grid_val), s_grid[-1])
+            is_isolated_point = (
+                # to be isolated, require:
+                # -> that there's only 1 point in s_grid in cur "interval" AND
+                (min_grid_ind_curinterval == max_grid_ind_curinterval) and
+                # -> that the interval does NOT extend to the left AND
+                ((sLeft == min_s_grid_val) or (invtcool_fn(sLeft) != 0.0)) and
+                # -> that the interval does NOT extend to the right
+                ((sRight == min_s_grid_val) or (invtcool_fn(sRight) != 0.0))
+            )
+                
+            if is_isolated_point:
+                # The current "interval" corresponds to a value in "s_grid"
+                # that just happens to __EXACTLY__ correspond to a isolated
+                # number where invtcool_fn evaluates to 0. This corresponds to
+                # the point where invtcool_fn either:
+                # - transitions between a positive & negative interval
+                # - has a local extrema that exactly evaluates to 0
+                #
+                # While one could think of this as infinitely thin interval,
+                # then you would have to treat all root-locations that way.
+                # so we effectively skip this interval
+                pass # by doing nothing, we skip this interval!
+            else:
+                # record the interval's sign and right edge
+                interval_signs.append(0.0)
+                if (max_grid_ind_curinterval + 1) == grid_length:
+                    assert sRight == max_s_grid_val # sanity check!
+                    edges.append(max_s_grid_val)
+                else:
+                    edges.append(zerointerval_transition(
+                        bracket = transition_bracket, **commonkw))
+
+    interval_vals = [EnergyFlow(e) for e in interval_signs]
+    return HeatCoolIntervals(intervals = edges, energy_flow = interval_vals)
+
+
 def _get_search_vals(step, lo, hi, start = None, log10step = False):
     # build a sorted array containing integer numbers of steps out from start
     # toward lo and hi.
@@ -53,10 +306,11 @@ def _report_zeroslope(s0, s1, inv_tcool_val):
 
 def _find_important_locations(inv_tcool, s_bounds, brute_step,
                               is_log10_brute_step, s_brute_start = None,
-                              maxiter_each = 500, s_rel_tol = 1e-8,
-                              skip_unstable_equilibrium = True):
+                              maxiter_each = 500, s_rel_tol = 1e-8):
     # I thought I could be a lot more clever here... Unfortunately you can't
     # if you want to get a general solution....
+
+    skip_unstable_equilibrium = False
 
     # prologue:
     s_min, s_max = s_bounds
@@ -87,50 +341,11 @@ def _find_important_locations(inv_tcool, s_bounds, brute_step,
     # STEP 1a: evaluate inverse cooling time at all brute-force grid points
     inv_tcool_vals = inv_tcool(brute_search_s_vals)
 
-    # STEP 2: find the roots that correspond to temperature equilibrium)
-    equilibrium_s_vals = []
-    sgn = np.sign(inv_tcool_vals)
-    for i in np.where(np.abs(sgn[:-1] + sgn[1:]) <= 1)[0]:
-        bracket = [brute_search_s_vals[i], brute_search_s_vals[i+1]]
-
-        if (inv_tcool_vals[i] != 0.0) and (inv_tcool_vals[i+1] != 0.0):
-            if ((inv_tcool_vals[i] < 0.0 < inv_tcool_vals[i+1]) and
-                skip_unstable_equilibrium):
-                # Since cooling occurs at lower thermal energy and heating
-                # occurs at higher thermal energy, this is unstable
-                continue
-            root_rslt = root_scalar(
-                f = inv_tcool, args = (), method='bisect', bracket = bracket,
-                rtol = s_rel_tol, maxiter = maxiter_each
-            )
-            if not root_rslt.converged:
-                raise RuntimeError("Not converged. Termination flag:\n " +
-                                   "   " + root_rslt.flag)
-            equilibrium_s_vals.append(root_rslt.root)
-        else:
-        
-            is_first_pair,is_final_pair = (i==0), ((i+2) == inv_tcool_vals.size)
-            if (inv_tcool_vals[i] == 0) and (inv_tcool_vals[i+1] == 0):
-                warn("encountered 2 contiguous brute-force grid points, with "
-                     f"parameter vals of {bracket}, where heating/cooling "
-                     "cancel. Doing our best to handle this case (but we may "
-                     "not handle it properly). If this is unintentional, "
-                     "consider changing brute_step")
-                equilibrium_s_vals.append(brute_search_s_vals[i])
-            elif inv_tcool_vals[i] == 0:
-                if ( is_first_pair and inv_tcool_vals[i] == 0):
-                    # ignore any stability concerns
-                    equilibrium_s_vals.append(brute_search_s_vals[i])
-                elif ( (inv_tcool_vals[i-1] > 0.0 > inv_tcool_vals[i+1]) or
-                       (not skip_unstable_equilibrium) ):
-                    equilibrium_s_vals.append(brute_search_s_vals[i])
-            else: # inv_tcool_vals[i+1] == 0
-                if is_final_pair:
-                    # skip stability concerns
-                    equilibrium_s_vals.append(brute_search_s_vals[i+1])
-                else:
-                    pass # we consider appending brute_search_s_vals[i+1] to
-                         # root_s_vals in a future iteration
+    # Step 2: find the intervals of heating/cooling
+    heat_cool_intervals = get_heat_cool_intervals(
+        invtcool_fn = inv_tcool, s_grid = brute_search_s_vals,
+        invtcool_grid = inv_tcool_vals,
+        maxiter_each = maxiter_each, s_rel_tol = s_rel_tol)
 
     # Step 3: find the local extrema
     # -> in principle, we could use the roots to find better starting
@@ -147,6 +362,11 @@ def _find_important_locations(inv_tcool, s_bounds, brute_step,
     for i in idx_potential_bracket_center:
         i_left, i_center, i_right = (i-1), i, (i+1)
         s_left, s_center, s_right = brute_search_s_vals[i-1:i+2]
+
+        # Note: In theory, it would be nice if we updated the h_c_intervals on
+        #       the offchance that we encountered an extrema that shifts between
+        #       heating and cooling (or just a single point where
+        #       heating/cooling cancel)
 
         if ( (inv_tcool_vals[i_left] != inv_tcool_vals[i_center]) and
              (inv_tcool_vals[i_center] != inv_tcool_vals[i_right]) ):
@@ -178,17 +398,10 @@ def _find_important_locations(inv_tcool, s_bounds, brute_step,
                 pass # we will report this interval in the next loop
 
     # some extra bookkeeping
-    if (s_min not in extrema_s_vals) and (s_min not in equilibrium_s_vals):
-        extrema_s_vals.append(s_min)
-    if (s_max not in extrema_s_vals) and (s_max not in equilibrium_s_vals):
-        extrema_s_vals.append(s_max)
+    if (s_min not in extrema_s_vals): extrema_s_vals.append(s_min)
+    if (s_max not in extrema_s_vals): extrema_s_vals.append(s_max)
 
-    # now let's format outputs
-    _s_vals, _is_thermal_eq = list(zip(*sorted(
-        [(s, True) for s in equilibrium_s_vals] +
-        [(s, False) for s in extrema_s_vals]
-    )))
-    return np.array(_s_vals), np.array(_is_thermal_eq)
+    return heat_cool_intervals, np.array(sorted(extrema_s_vals))
         
 
 def find_special_locations(parametric_curve, *, s_bounds, brute_step,
@@ -250,13 +463,11 @@ def find_special_locations(parametric_curve, *, s_bounds, brute_step,
 
     Returns
     -------
-    special_s_vals: np.ndarray
-        sorted 1D array specifying locations along the curve where "special"
-        points occur
-    is_thermal_eq: np.ndarray
-        1D array of booleans of the same shape `special_s_vals`. Values that
-        are `True`, indicate that the corresponding entry in `special_s_vals`
-        specifies thermodynamic equilibrium.
+    heat_cool_intervals : HeatCoolIntervals
+        object representing the heating and cooling intervals
+    critical_s_vals: np.ndarray
+        sorted 1D array specifying locations along the curve where extrema
+        may occur
 
     Notes
     -----
@@ -304,13 +515,12 @@ def find_special_locations_isobar(pthermal_div_gm1, *, specific_eint_bounds,
 
     Returns
     -------
-    special_eint_vals: np.ndarray
-        sorted 1D array specifying locations along the curve where "special"
-        points occur. These are values of the specific internal energy.
-    is_thermal_eq: np.ndarray
-        1D array of booleans of the same shape `special_e_vals`. Values that
-        are `True`, indicate that the corresponding entry in `special_e_vals`
-        specifies thermodynamic equilibrium.
+    heat_cool_intervals : HeatCoolIntervals
+        object representing the heating and cooling intervals. The intervals
+        are indexed in terms of the specific internal energy
+    critical_eint_vals: np.ndarray
+        sorted 1D array specifying eint along the isobar where extrema
+        may occur
     """
 
     def isobar_parametric_curve(specific_eint):
