@@ -16,7 +16,11 @@ class HeatCoolIntervals:
         self.intervals = np.array(intervals)
         self.energy_flow = energy_flow
         assert len(intervals) > 1
-        assert len(energy_flow) == (intervals.size - 1)
+        assert len(energy_flow) == (self.intervals.size - 1)
+
+    def __repr__(self):
+        return (f"HeatCoolIntervals(intervals = {self.intervals!r}, " +
+                f"energy_flow = {self.energy_flow!r}")
 
     @property
     def num_intervals(self): return self.intervals.size - 1
@@ -65,15 +69,21 @@ def zerointerval_transition(f, bracket, rtol, maxiter):
     # we may be able to use it to help us find the point faster...
 
     if len(bracket) != 2:
-        raise ValueError("bracket must contain 2 values")
+        raise ValueError(f"{bracket!r} isn't a valid bracket: it must be a 2 "
+                         "element sequence")
     elif (bracket[0] >= bracket[1]):
-        raise ValueError("bracket[0] must exceed bracket[1]")
+        raise ValueError(f"{bracket!r} isn't a valid bracket: bracket[1] must "
+                         "exceed bracket[0]")
+    elif any(e <= 0.0 for e in bracket):
+        # this is a requirement as long as we just make use of rtol (and don't
+        # use atol)
+        raise ValueError(f"{bracket!r} isn't a valid bracket: both elements "
+                         "must currently be positive")
     elif not (0.0 < rtol < 1.0):
         raise ValueError("rtol must lie between 0.0 and 1.0")
     elif (maxiter <= 0) or (int(maxiter) != maxiter):
         raise ValueError("maxiter must be a positive integer")
 
-    assert (l > 0) and (r > 0)
     l,r = bracket
     f_l, f_r = f(l), f(r)
     if (f_l == 0.0 and f_r != 0.0):
@@ -166,13 +176,6 @@ def get_heat_cool_intervals(invtcool_fn, s_grid, invtcool_grid = None,
     edges = [s_grid[0]]  # <-- will have N+1 items for N intervals
     interval_signs = []  # <-- will have N items for N intervals
 
-    if sign_grid[0] == 0.0:
-        # we would should investigate whether this is a part of an interval
-        # with EnergyFlow.NEUTRAL OR it corresponds to a natural transition to
-        # EnergyFlow.COOL/EnergyFlow.HEAT
-        raise RuntimeError("setup needs to be more careful when "
-                           "sign_grids[0] has a value of 0")
-
     grid_length = s_grid.size
     # Each time we enter the while loop, we are considering a new interval.
     # - in the body of the while loop, we determine the extent of the interval
@@ -182,7 +185,7 @@ def get_heat_cool_intervals(invtcool_fn, s_grid, invtcool_grid = None,
         # the current interval extends from s = edges[-1]
 
         # First, find the min element from s_grid contained in cur interval
-        min_grid_ind_curinterval = max_grid_index_curinterval + 1
+        min_grid_ind_curinterval = max_grid_ind_curinterval + 1
         # invariant: s_grid[min_grid_ind_curinterval] >= edges[-1]
 
         # Next, find the max element from s_grid contained in cur interval
@@ -195,7 +198,7 @@ def get_heat_cool_intervals(invtcool_fn, s_grid, invtcool_grid = None,
         # Finally, we do the work of finding the precise end point and we
         # record things
         transition_bracket = (
-            sign_grid[max_grid_ind_curinterval:(max_grid_ind_curinterval+2)])
+            s_grid[max_grid_ind_curinterval:(max_grid_ind_curinterval+2)])
         if cur_interval_sign != 0.0:
             interval_signs.append(cur_interval_sign)
             if (max_grid_ind_curinterval + 1) == grid_length:
@@ -287,7 +290,15 @@ def _get_search_vals(step, lo, hi, start = None, log10step = False):
     search_start_index = nsteps_L
     return search_start_index, out
 
-def _report_zeroslope(s0, s1, inv_tcool_val):
+def _report_zeroslope(s0, s1, inv_tcool_val, heat_cool_intervals):
+    if inv_tcool_val == 0.0:
+        intervals = heat_cool_intervals.identify_interval(np.array([s0,s1]))
+        eflow = heat_cool_intervals.get_energy_flow(intervals[0])
+        if ((intervals[0] == intervals[1]) and (eflow == EnergyFlow.NEUTRAL)):
+            # if the zero-slope is in a known region without heat-flow, no need
+            # to report it...
+            return
+
     _msg_template = (
         f"Encountered an interval of {{direction}} between parameter "
         f"values of {s0!r} and {s1!r} where the reciprocal of the "
@@ -295,10 +306,11 @@ def _report_zeroslope(s0, s1, inv_tcool_val):
         f"{inv_tcool_val}.\n\n{{cust}}\n\n"
         f"If this is unexpected, consider reducing the brute_step arg"
     )
-    if inv_tcool_vals[i0] > 0:
+    if inv_tcool_val >= 0:
         custom_part = (
-            "Since this only affects heating, the function will carry on. But, "
-            "of the extrema when heating dominates may not be well behaved")
+            "Since this zero-slope region doesn't affect cooling, the function "
+            "will carry on. But, the locations of the extrema when heating "
+            "dominates may not be well behaved")
         warn(_msg_template.format(direction = "heating", cust = custom_part))
     else:
         raise RuntimeError(
@@ -309,8 +321,6 @@ def _find_important_locations(inv_tcool, s_bounds, brute_step,
                               maxiter_each = 500, s_rel_tol = 1e-8):
     # I thought I could be a lot more clever here... Unfortunately you can't
     # if you want to get a general solution....
-
-    skip_unstable_equilibrium = False
 
     # prologue:
     s_min, s_max = s_bounds
@@ -390,10 +400,12 @@ def _find_important_locations(inv_tcool, s_bounds, brute_step,
             # continue onwards
             if (inv_tcool_vals[i_left] == inv_tcool_vals[i_center]):
                 _report_zeroslope(s0 = s_left, s1 = s_center,
-                                  inv_tcool_val = inv_tcool_vals[i_center])
+                                  inv_tcool_val = inv_tcool_vals[i_center],
+                                  heat_cool_intervals = heat_cool_intervals)
             elif (i_right+1 == inv_tcool_vals.size):
-                _report_zeroslope(s0 = s_left, s1 = s_center,
-                                  inv_tcool_val = inv_tcool_vals[i_center])
+                _report_zeroslope(s0 = s_center, s1 = s_right,
+                                  inv_tcool_val = inv_tcool_vals[i_center],
+                                  heat_cool_intervals = heat_cool_intervals)
             else:
                 pass # we will report this interval in the next loop
 
@@ -406,8 +418,7 @@ def _find_important_locations(inv_tcool, s_bounds, brute_step,
 
 def find_special_locations(parametric_curve, *, s_bounds, brute_step,
                            is_log10_brute_step, cooling_curve,
-                           maxiter_each = 500, s_rel_tol = 1e-8,
-                           skip_unstable_equilibrium = False):
+                           maxiter_each = 500, s_rel_tol = 1e-8):
     """
     Find the "special points" for some cooling curve.
 
@@ -474,21 +485,31 @@ def find_special_locations(parametric_curve, *, s_bounds, brute_step,
     Currently we use a fairly exhaustive approach. In principle we don't need
     to be so exhaustive.
     """
-
-    def inv_tcool(s):
-        vals = parametric_curve(s)
-        return 1.0/cooling_curve.calculate_tcool_CGS(*vals)
+    if hasattr(cooling_curve, 'calculate_tcool_CGS'):
+        def inv_tcool(s):
+            vals = parametric_curve(s)
+            return 1.0/cooling_curve.calculate_tcool_CGS(*vals)
+    elif hasattr(cooling_curve, 'calculate_tcool'):
+        warn("assuming that parametric_curve returns mass_density followed by "
+             "specific internal energy")
+        import unyt
+        def inv_tcool(s):
+            rho_cgs, eint_cgs = parametric_curve(s)
+            tcool = cooling_curve.calculate_tcool(
+                unyt.unyt_array(rho_cgs,'g/cm**3'),
+                unyt.unyt_array(eint_cgs,'cm**2/s**2'))
+            return 1.0/(tcool.to('s').ndview)
+    else:
+        raise TypeError("invalid cooling_curve argument")
 
     return _find_important_locations(
         inv_tcool = inv_tcool, s_bounds = s_bounds, brute_step = brute_step,
         is_log10_brute_step = is_log10_brute_step, s_brute_start = None,
-        maxiter_each = maxiter_each, s_rel_tol = s_rel_tol,
-        skip_unstable_equilibrium = skip_unstable_equilibrium)
+        maxiter_each = maxiter_each, s_rel_tol = s_rel_tol)
 
 def find_special_locations_isobar(pthermal_div_gm1, *, specific_eint_bounds,
                                   brute_step, is_log10_brute_step, cooling_eos,
-                                  maxiter_each = 500, s_rel_tol = 1e-8,
-                                  skip_unstable_equilibrium = False):
+                                  maxiter_each = 500, s_rel_tol = 1e-8):
     """
     A convenience function that wraps find_special_locations for the simple
     case where gas is assumed to be distributed along an isobar
@@ -534,8 +555,7 @@ def find_special_locations_isobar(pthermal_div_gm1, *, specific_eint_bounds,
         s_bounds = specific_eint_bounds, cooling_curve = cooling_eos,
         brute_step = brute_step,
         is_log10_brute_step = is_log10_brute_step,
-        maxiter_each = maxiter_each, s_rel_tol = 1e-8,
-        skip_unstable_equilibrium = skip_unstable_equilibrium)
+        maxiter_each = maxiter_each, s_rel_tol = 1e-8)
 
 if __name__ == '__main__':
     def inv_tcool(x):
@@ -544,6 +564,5 @@ if __name__ == '__main__':
     rslt = _find_important_locations(
         inv_tcool, s_bounds = (-15,12), brute_step = 0.2,
         is_log10_brute_step = False, s_brute_start = None,
-        maxiter_each = 500, s_rel_tol = 1e-8,
-        skip_unstable_equilibrium = False)
+        maxiter_each = 500, s_rel_tol = 1e-8)
     print(rslt)

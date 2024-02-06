@@ -1,8 +1,10 @@
+from warnings import warn
+
 import numpy as np
 import unyt
 import unyt.dimensions as udim
 
-from cool_func_stats import find_special_locations_isobar
+from cool_func_stats import find_special_locations_isobar, EnergyFlow
 from cholla_cooling import ChollaEOS
 
 
@@ -14,11 +16,6 @@ def _find_loc_mintcool(eos, Tmin, Tmax,
     # pressure (between Tmin and Tmax)
     #
     # At the moment, this will only work with Cholla's CIE cooling curve!
-    
-    if (not isinstance(eos, ChollaEOS)) or (not eos.using_CIE_cooling()):
-        raise RuntimeError("At the moment, this function is not general "
-                           "purpose enough to work with anything other "
-                           "than Cholla's CIE cooling curve")
 
     # strip off units (if applicable)
 
@@ -30,40 +27,71 @@ def _find_loc_mintcool(eos, Tmin, Tmax,
     log_specific_eint_step = 0.1
 
     gm1 = (eos.get_gamma() - 1)
-    special_eint_vals, is_thermal_eq = find_special_locations_isobar(
-        pthermal_div_gm1 = pressure / gm1,
+    heat_cool_intervals, eint_cgs_extrema = find_special_locations_isobar(
+        pthermal_div_gm1 = (pressure / gm1).in_cgs().ndview,
         specific_eint_bounds = [specific_eint_min, specific_eint_max],
         brute_step = log_specific_eint_step,
         is_log10_brute_step = True,
         cooling_eos = eos,
-        maxiter_each = 500, s_rel_tol = 1e-8,
-        skip_unstable_equilibrium = False)
-    special_eint_vals = unyt.unyt_array(special_eint_vals, 'cm**2/s**2')
-    
-    special_rho_vals = pressure / gm1 / special_eint_vals
-    special_tcool = eos.calculate_tcool(rho = special_rho_vals,
-                                        eint = special_eint_vals)
-    
-    # sanity-checks!
-    assert special_eint_vals.size == 3
-    # confirm that all of special values are related to cooling (not heating!)
-    assert np.all(special_tcool < 0.0).all()
-    assert np.all(np.logical_not(is_thermal_eq)) # no thermodynamic equilibrium
-    
-    special_T = eos.calculate_T(rho = special_rho_vals,
-                                eint = special_eint_vals)
+        maxiter_each = 500, s_rel_tol = 1e-8)
 
-    min_index = np.argmin(np.abs(special_tcool))
+    # sanity checks
+    assert np.all(eint_cgs_extrema.min() >= heat_cool_intervals.intervals[0])
+    assert np.all(eint_cgs_extrema.max() <= heat_cool_intervals.intervals[-1])
+
+    eint_extrema = unyt.unyt_array(eint_cgs_extrema, 'cm**2/s**2')
+    rho_extrema = pressure / gm1 / eint_extrema
+    tcool_at_extrema = eos.calculate_tcool(rho = rho_extrema,
+                                           eint = eint_extrema)
+
+    # here we enforce some sanity checks!
+    num_intervals = heat_cool_intervals.num_intervals
+    if num_intervals == 0:
+        raise RuntimeError("Something went horribly wrong")
+    elif ((num_intervals == 1) and
+          (heat_cool_intervals.get_energy_flow(0) != EnergyFlow.COOL)):
+        warn("The specified cooling curve does not have any cooling")
+        return np.nan, np.nan, np.nan
+    elif (num_intervals == 1):
+        # the entire cooling function range just has cooling
+        eint_mincool = eint_extrema[np.argmin(np.abs(tcool_at_extrema))]
+    elif (num_intervals == 2):
+        # todo: add support for the case where cooling is turned off at higher
+        #       temperatures (to prevent cooling of the wind)
+        if ((heat_cool_intervals.get_energy_flow(0) == EnergyFlow.COOL) or
+            (heat_cool_intervals.get_energy_flow(1) != EnergyFlow.COOL)):
+            # listing both of these conditions, rather than just 1 includes the
+            # pathological case where there is an extrema that corresponds to
+            # a cooling rate of 0.0 at a single Temperature
+            raise RuntimeError(
+                "For a cooling curve with 2 heating/cooling/neutral regions, "
+                "we can't currently handle the case where the lower interval "
+                "corresponds to cooling and/or the upper interval corresponds "
+                "to heating/neutral energy flow")
+
+        # identify the extrema candidates in the higher temperature interval
+        # (that interval corresponds to cooling)
+        w_cooling = (tcool_at_extrema < 0)
+        mincool_index = np.argmin(np.abs(tcool_at_extrema * w_cooling))
+        eint_mincool = eint_extrema[w_cooling]
+    else:
+        raise RuntimeError(
+            "can't handle cases with more than 2 cooling intervals yet!")
+
+    rho_mincool = pressure / gm1 / eint_mincool
+    T_mincool = eos.calculate_T(rho = rho_mincool, eint = eint_mincool)
+    mintcool = eos.calculate_tcool(rho = rho_mincool, eint = eint_mincool)
+
     if False:
         phat = float((pressure / unyt.kboltz_cgs).to('K/cm**3').v)
         print(f"min tcool for {float(Tmin.to('K').v):.3e} <= (T/K) <= "
               f"{float(Tmax.to('K').v):.3e}, at pressure/kB = "
               f"{float(phat):.3e} K/cm**3 is:\n"
-              f"     |tcool| = {special_tcool[min_index]}\n"
-              f"     it occurs at T = {special_T[min_index]}"#or equivalently\n"
+              f"     |tcool| = {np.abs(mintcool)}\n"
+              f"     it occurs at T = {T_mincool}"#or equivalently\n"
               #f"     at eint = {special_eint_vals[min_index]}"
         )
-    return special_eint_vals[min_index], special_T[min_index], special_tcool[min_index]
+    return eint_mincool, T_mincool, mintcool
 
 def find_minmix(Tcl, Tw, assumed_p, eos):
     """
@@ -136,7 +164,7 @@ def estimate_survival_radius(eos, vwind, density_contrast, pressure, alpha = 7,
     ----------
     vwind : unyt.unyt_quantity
         Speed of the wind (in the cloud's reference frame)
-    density : float
+    density_contrast : float
         ratio between cloud mass density and wind mass density
     pressure : unyt.unyt_quantity
         The thermal_pressure that assumed to be constant for the
@@ -161,7 +189,9 @@ def estimate_survival_radius(eos, vwind, density_contrast, pressure, alpha = 7,
         new_eint = cur_rho * cur_eint / new_rho
         return eos.calculate_T(new_rho, new_eint)
 
-    if (temperature_cl is None) == (temperature_w is None):
+    if np.ndim(pressure) > 0:
+        raise ValueError("The pressure argument must be a scalar")
+    elif (temperature_cl is None) == (temperature_w is None):
         raise ValueError(
             "the user must specify one either temperature_cl OR "
             "temperature_w (BUT NOT BOTH)")

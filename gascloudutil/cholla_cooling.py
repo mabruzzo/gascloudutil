@@ -96,14 +96,18 @@ class ChollaEOS:
     def using_CIE_cooling(self):
         return not isinstance(self._cooling_func, _ChollaCloudyCoolingFunc)
 
-    def _calculate_nT(self, rho, eint):
-        # rho is mass density and eint is specific internal energy (aka
+    def _calculate_nT_CGS(self, rho_cgs, eint_cgs):
+        # rho_cgs is mass density and eint_cgs is specific internal energy (aka
         # specific thermal energy).
-        # -> They both have cgs units (g/cm**3 & (cm/s)**2, respectively)
-        n = rho / (self._mmw * self._constants.mh_quan())
+        # -> neither argument should be a unyt.unyt_array instance. Instead
+        #    they ordinary `float` instances or ordinary numpy arrays (with
+        #    broadcastable shapes)
+        # -> This function assumes that they have cgs units (g/cm**3 &
+        #    (cm/s)**2, respectively). The returned values are in cgs units
+        n = rho_cgs / (self._mmw * self._constants.mh_cgs)
         gm1 = self._gamma - 1.0
-        T = ( eint * (self._mmw * self._constants.mh_quan() * gm1) /
-              (self._constants.kboltz_quan()) )
+        T = ( eint_cgs * (self._mmw * self._constants.mh_cgs * gm1) /
+              self._constants.kboltz_cgs )
         return n,T
 
     @udims.returns(udims.temperature)
@@ -111,8 +115,8 @@ class ChollaEOS:
     def calculate_T(self, rho, eint):
         # rho is mass density and eint is specific internal energy (aka
         # specific thermal energy).
-        # -> They both have cgs units (g/cm**3 & (cm/s)**2, respectively)
-        return self._calculate_nT(rho, eint)[1]
+        return self._calculate_nT_CGS(rho.in_cgs().v,
+                                      eint.in_cgs().v)[1] * unyt.K
 
     def rho_eint_from_nT_CGS(self, number_density, T):
         rho = number_density * (self._mmw * self._constants.mh_cgs)
@@ -147,12 +151,12 @@ class ChollaEOS:
     def _calculate_tcool(self, n, T, eint_dens):
         fn = self._cooling_func
         cool = -1.0 * fn(n = n, T=T)
-        
-        return eint_dens / cool
+        with np.errstate(divide = 'ignore'):
+            return eint_dens / cool
 
     def calculate_tcool_CGS(self, rho, eint):
         # just like calculate_tcool, but CGS units are implied!
-        n, T = self._calculate_nT(rho, eint)
+        n, T = self._calculate_nT_CGS(rho_cgs = rho, eint_cgs = eint)
         return self._calculate_tcool(n, T, eint_dens = rho * eint)
 
     @udims.returns(udims.time)
