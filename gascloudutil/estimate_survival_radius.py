@@ -207,6 +207,7 @@ def estimate_survival_radius(eos, vwind, density_contrast, pressure, alpha = 7,
                                pressure = pressure, eos = eos)
     rslt = find_minmix(Tcl = T_cl, Tw = T_w, assumed_p = pressure,
                        eos = eos)
+    print(rslt)
     tcool_minmix = rslt['tcool_minmix']
     if tcool_minmix >= 0:
         raise RuntimeError(

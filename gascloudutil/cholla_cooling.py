@@ -2,6 +2,7 @@ import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 import unyt
 import unyt.dimensions as udims
+from enum import auto, Enum
 
 class _ChollaConstants:
     kboltz_cgs: float = 1.380658e-16
@@ -12,6 +13,15 @@ class _ChollaConstants:
     def mh_quan(self):
         return unyt.unyt_quantity(self.mh_cgs, "g")
 
+def _CIE_cooling_update(cooling_rate, logT):
+    cooling_rate[logT < 4.0] = 0.0
+    w = np.logical_and(logT >= 4.0, logT < 5.9)
+    cooling_rate[w] = 10.0**(-1.3 * (logT[w] - 5.25) * (logT[w] - 5.25) - 21.25)
+    w = np.logical_and(logT >= 5.9, logT < 7.4)
+    cooling_rate[w] = 10.0**(0.7 * (logT[w] - 7.1) * (logT[w] - 7.1) - 22.8)
+    w = logT >= 7.4
+    cooling_rate[w] = 10.0**(0.45 * logT[w] - 26.065)
+
 def _cholla_CIE_cooling_func(n, T):
     # n is number denstiy (in units of cm**-3) and T is temperature (in Kelvin)
     #
@@ -21,20 +31,42 @@ def _cholla_CIE_cooling_func(n, T):
     assert np.ndim(T) <= 1
 
     cooling_rate = np.empty(dtype = 'f8', shape = T.shape)
-
     logT = np.log10(T)
-    cooling_rate[logT < 4.0] = 0.0
-    w = np.logical_and(logT >= 4.0, logT < 5.9)
-    cooling_rate[w] = 10.0**(-1.3 * (logT[w] - 5.25) * (logT[w] - 5.25) - 21.25)
-    w = np.logical_and(logT >= 5.9, logT < 7.4)
-    cooling_rate[w] = 10.0**(0.7 * (logT[w] - 7.1) * (logT[w] - 7.1) - 22.8)
-    w = logT >= 7.4
-    cooling_rate[w] = 10.0**(0.45 * logT[w] - 26.065)
-
+    _CIE_cooling_update(cooling_rate, logT)
     return (n*n)*cooling_rate
 
+def _cholla_TI_cooling_func_NOHEAT(n, T):
+    # n is number denstiy (in units of cm**-3) and T is temperature (in Kelvin)
+    #
+    # returns volumetric rate of cooling (positive values correspond to coolin)
+    n, T = np.asanyarray(n), np.asanyarray(T)
+    assert np.ndim(n) <= 1
+    assert np.ndim(T) <= 1
+
+    cooling_rate = np.empty(dtype = 'f8', shape = T.shape)
+    logT = np.log10(T)
+    _CIE_cooling_update(cooling_rate, logT)
+    w = np.logical_and(logT >= 1.0, logT < 4.0)
+    cooling_rate[w] = 2e-26 * (1e7 * np.exp(-1.148e5 / (T[w] + 1000.0)) + 1.4e-2 * np.sqrt(T[w]) * np.exp(-92.0 / T[w]))
+    return (n*n)*cooling_rate
+    
+
+class CoolingKind(Enum):
+    CIE=auto()
+    TI_COOL_NOHEAT=auto()
+    TI_COOL_AND_PHOTOELECTRIC=auto()
+    PHOTOELECTRIC_HEATING=auto()
+
+class CloudyCoolKind(Enum):
+    HEAT_AND_COOL = auto()
+    HEAT_ONLY = auto()
+    COOL_ONLY = auto()
+
 class _ChollaCloudyCoolingFunc:
-    def __init__(self, path):
+    def __init__(self, path, cool_kind = None):
+        if cool_kind is None:
+            cool_kind=CloudyCoolKind.HEAT_AND_COOL
+        self.cool_kind = cool_kind
         log_n, log_T, log_cool_div_n2, log_heat_div_n2 = np.loadtxt(
             path, dtype = 'f4', unpack = True)
 
@@ -69,28 +101,88 @@ class _ChollaCloudyCoolingFunc:
         # we aren't currently handling bounds_errors consistently. Currently,
         # we raise an error while I suspect Cholla may just pick the nearest
         # value (although, they set cooling to 0 below 10 K)
-        cooling_rate = self._log_interp_div_n2['cool'](pts)
-        heating_rate = self._log_interp_div_n2['heat'](pts)
+        if self.cool_kind is CloudyCoolKind.HEAT_ONLY:
+            cooling_rate = 0.0
+        else:
+            cooling_rate = 10.0**self._log_interp_div_n2['cool'](pts)
+        if self.cool_kind is CloudyCoolKind.COOL_ONLY:
+            heating_rate = 0.0
+        else:
+            heating_rate = 10.0**self._log_interp_div_n2['heat'](pts)
 
         # cool has units of erg/s/cm**3 (it's volumetric cooling rate)
-        cool = n * n * (10.0 ** cooling_rate - 10.0** heating_rate)
+        cool = n * n * (cooling_rate - heating_rate)
 
         if return_scalar:
             return cool[0]
         return cool
 
+class PhotoelectricHeating:
+    def __init__(self, n_av, T_cut=1e4):
+        self.n_av = n_av
+        self.T_cut = T_cut
+
+    def __call__(self, n, T):
+        # expects arguments to be in units of cgs
+        assert np.shape(n) == np.shape(T)
+        cooling_rate = np.empty(dtype = 'f8', shape = T.shape)
+        w = T < self.T_cut
+        cooling_rate[w] = n[w]*self.n_av*-1e-26
+        cooling_rate[~w] = 0.0
+        return cooling_rate
+
+class HybridCoolHeating:
+    def __init__(self, fn_l):
+        self.fn_l = fn_l
+
+    def __call__(self, n, T):
+        # expects arguments to be in units of cgs
+        assert np.shape(n) == np.shape(T)
+        cooling_rate = np.zeros(dtype = 'f8', shape = T.shape)
+        for fn in self.fn_l:
+            cooling_rate += fn(n=n,T=T)
+        return cooling_rate
+
 class ChollaEOS:
 
-    def __init__(self, cloudy_data_path = None, mmw = 0.6, gamma = 5.0/3.0,
+    def __init__(self, cooling_arg = None, mmw = 0.6, gamma = 5.0/3.0,
+                 cloudy_cool_kind = None, photoelectric_heating_n_av = None,
                  constants = _ChollaConstants()):
 
         self._mmw = mmw # mean molecular weight
         self._gamma = gamma # adiabatic index
 
-        if cloudy_data_path is not None:
-            self._cooling_func = _ChollaCloudyCoolingFunc(cloudy_data_path)
+        photoheating = None
+        if photoelectric_heating_n_av is not None:
+            photoheating = PhotoelectricHeating(
+                n_av = photoelectric_heating_n_av
+            )
+
+        if cooling_arg is None or isinstance(cooling_arg, CoolingKind):
+            assert cloudy_cool_kind is None
+            if (cooling_arg is None) or (cooling_arg is CoolingKind.CIE):
+                assert photoheating is None
+                self._cooling_func = _cholla_CIE_cooling_func
+            elif (cooling_arg is CoolingKind.PHOTOELECTRIC_HEATING):
+                assert photoheating is not None
+                self._cooling_func = photoheating
+            elif (cooling_arg is CoolingKind.TI_COOL_NOHEAT):
+                assert photoheating is None
+                self._cooling_func = _cholla_TI_cooling_func_NOHEAT
+            elif (cooling_arg is CoolingKind.TI_COOL_AND_PHOTOELECTRIC):
+                assert photoheating is not None
+                self._cooling_func = HybridCoolHeating(
+                    [_cholla_TI_cooling_func_NOHEAT, photoheating]
+                )
+            else:
+                raise ValueError(f"we haven't added support for {cooling_arg}")
         else:
-            self._cooling_func = _cholla_CIE_cooling_func
+            fn = _ChollaCloudyCoolingFunc(cooling_arg, cloudy_cool_kind)
+            if photoheating is None:
+                self._cooling_func = fn
+            else:
+                self._cooling_func = HybridCoolHeating([fn, photoheating])
+
         self._constants = constants
 
     def using_CIE_cooling(self):
@@ -153,6 +245,14 @@ class ChollaEOS:
         cool = -1.0 * fn(n = n, T=T)
         with np.errstate(divide = 'ignore'):
             return eint_dens / cool
+
+    @udims.returns(udims.energy/udims.time/ udims.volume)
+    @udims.accepts(number_density = udims.number_density, T = udims.temperature)
+    def cooling_rate_from_nT(self, n, T):
+        fn = self._cooling_func
+        cool = -1.0 * fn(n = n.in_cgs().ndview, T=T.in_cgs().ndview)
+        return unyt.unyt_array(cool, 'erg/s/cm**3')
+        
 
     def calculate_tcool_CGS(self, rho, eint):
         # just like calculate_tcool, but CGS units are implied!
